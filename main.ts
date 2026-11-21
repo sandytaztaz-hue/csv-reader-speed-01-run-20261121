@@ -1,23 +1,34 @@
-// Driver: reads every case from $MAKEFUN_INPUT_DIR/cases.json (or /input),
-// answers each one alone with run() from solve.js, and writes the answers
-// array (one per case, in order) to $MAKEFUN_OUTPUT_DIR/answers.json
-// (or /output). V8 incremental marking is switched off before solve.js is
-// imported so the timed run is not perturbed by background GC marking.
+// Driver the harness runs: node /bot/main.ts (Node 22).
+// Reads every case from /input/cases.json, answers each one alone with
+// run() from solve.js, writes /output/answers.json as a JSON array.
+// The answers are JSON text already, so they are concatenated directly:
+// no JSON.parse of any answer and no JSON.stringify of the array.
+// Plain JavaScript in a .ts file: no TypeScript-only syntax, so Node's
+// type stripping runs it as-is.
 import { setFlagsFromString } from 'node:v8';
+import { readFileSync, mkdirSync, openSync, writeSync, closeSync } from 'node:fs';
+
 setFlagsFromString('--no-incremental-marking');
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
 
-const { run } = await import('./solve.js');
+// solve.js is imported only after the V8 flag above is set.
+const { runBytes } = await import('./solve.js');
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+const cases = JSON.parse(readFileSync(inputDir + '/cases.json', 'utf8'));
 
-const raw = await readFile(join(inputDir, 'cases.json'), 'utf8');
-const cases = JSON.parse(raw);
-if (!Array.isArray(cases)) throw new Error('cases.json must hold a JSON array of cases');
-
-const answers = [];
-for (const c of cases) answers.push(run(c.input ?? c));
-await mkdir(outputDir, { recursive: true });
-await writeFile(join(outputDir, 'answers.json'), JSON.stringify(answers));
+// The answers are JSON text already, so they are written straight to
+// the file as bytes, one case at a time: no JSON.parse of any answer,
+// no JSON.stringify of the array, and no 12 MB joined string.
+// runBytes returns a byte range in WASM memory, valid until the next
+// case is parsed, so each case is written before the next one runs.
+mkdirSync(outputDir, { recursive: true });
+const fd = openSync(outputDir + '/answers.json', 'w');
+writeSync(fd, '[');
+for (let i = 0; i < cases.length; i++) {
+  if (i > 0) writeSync(fd, ',');
+  const range = runBytes(cases[i].input);
+  writeSync(fd, new Uint8Array(range.buffer, range.byteOffset, range.byteLength));
+}
+writeSync(fd, ']');
+closeSync(fd);
