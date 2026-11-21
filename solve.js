@@ -1,9 +1,14 @@
-// CSV reader v3 — written fresh from CSV_SPEC.md + the v3 design brief.
+// CSV reader v4 — written fresh from CSV_SPEC.md + V3_BRIEF.md.
 // Three tiers: (1) clean single-line records split in bulk; (2) quoted
 // records parsed field-by-field straight from the text with indexOf scans
 // (the hot path — no split/merge, no segment slicing); (3) a careful
 // field-by-field parser for stray CRs, unterminated quotes and quote junk.
-// Tiers 1-2 never loop character-by-character over the common path.
+// v4 vs v3: Tier 2 tracks the next line break (`nl`) across the whole
+// record instead of re-scanning for '\n' on every unquoted field — the
+// '\n' search used to re-scan to end-of-line per field; now it is one
+// indexOf per record, re-scanned only when a multi-line quoted field
+// swallows the tracked line end. Tiers 1-2 never loop character by
+// character over the common path.
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
@@ -191,11 +196,17 @@ export function run(input) {
   }
 
   // Tier 2: parse one record field-by-field directly from `text` at pos.
+  // `nl` is the index of the first '\n' at-or-after pos (or -1), found by
+  // the caller while routing; it is tracked across the record so an
+  // unquoted field never re-scans for '\n'. Invariant: `nl` is the first
+  // '\n' at-or-after pos, or -1 when there is none left. It survives a
+  // comma (the comma sits before `nl`), and after a quoted field it is
+  // re-found only if the quoted span swallowed it (multi-line field).
   // Returns {fields, firstQuoted}, or null when the record needs Tier 3
   // (unterminated quote, junk after a closing quote, or a stray CR inside
   // an unquoted field). Pushes no errors itself; on null the caller rolls
   // pos/line back to the record start and runs Tier 3.
-  function parseRecordTier2() {
+  function parseRecordTier2(nl) {
     const fields = [];
     let firstQuoted = false;
     let first = true;
@@ -227,6 +238,7 @@ export function run(input) {
         if (first) firstQuoted = true;
         first = false;
         pos = close + 1;
+        if (nl !== -1 && nl < pos) nl = text.indexOf('\n', pos);
         if (pos >= len) {
           fields.push(value);
           return { fields: fields, firstQuoted: firstQuoted };
@@ -251,23 +263,22 @@ export function run(input) {
         }
         return null; // junk after the closing quote
       }
-      // Unquoted field: next ',' vs next '\n', whichever is nearer.
+      // Unquoted field: next ',' vs the tracked line break `nl`.
       const c = text.indexOf(',', pos);
-      const n = text.indexOf('\n', pos);
       let end2;
       let isComma;
-      if (c !== -1 && (n === -1 || c < n)) {
+      if (c !== -1 && (nl === -1 || c < nl)) {
         end2 = c;
         isComma = true;
-      } else if (n !== -1) {
-        end2 = n;
+      } else if (nl !== -1) {
+        end2 = nl;
         isComma = false;
       } else {
         end2 = len;
         isComma = false;
       }
       let value;
-      if (!isComma && n !== -1 && end2 > pos && text.charCodeAt(end2 - 1) === 13) {
+      if (!isComma && nl !== -1 && end2 > pos && text.charCodeAt(end2 - 1) === 13) {
         value = text.slice(pos, end2 - 1); // CRLF line ending, not a stray CR
       } else {
         value = text.slice(pos, end2);
@@ -279,7 +290,7 @@ export function run(input) {
         pos = end2 + 1;
         continue;
       }
-      if (n !== -1) {
+      if (nl !== -1) {
         pos = end2 + 1;
         line++;
       } else {
@@ -335,6 +346,7 @@ export function run(input) {
     // Inspect the first line: is there a quote in it? (A quote means the
     // record needs Tier 2; a stray CR inside a quoted field is NOT stray —
     // Tier 2 normalises it — so no separate CR scan is needed here.)
+    // `nl` doubles as Tier 2's tracked line break for this record.
     const nl = text.indexOf('\n', pos);
     const end = nl === -1 ? len : nl;
     const qPos = text.indexOf('"', pos);
@@ -366,7 +378,7 @@ export function run(input) {
     // Tier 2: quoted record, indexOf field scan. Roll back to Tier 3 on null.
     const savePos = pos;
     const saveLine = line;
-    const t2 = parseRecordTier2();
+    const t2 = parseRecordTier2(nl);
     if (t2 !== null) {
       emit(t2.fields, t2.fields.length === 1 && t2.fields[0] === '' && !t2.firstQuoted);
       continue;
